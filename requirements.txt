@@ -5,3 +5,4 @@ supabase
 scipy
 numpy
 python-dotenv
+bcrypt
