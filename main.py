@@ -8,8 +8,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from scipy import stats
 from supabase import Client, create_client
+
+# Pesos del modelo de ranking (Programa_optimizador_asignacion_proveedores_1.ipynb).
+PESO_COSTE = 0.50
+PESO_VALORACION = 0.30
+PESO_CAPACIDAD = 0.20
 
 load_dotenv()
 
@@ -29,7 +33,7 @@ app.add_middleware(
 
 
 class RequestRecomendacion(BaseModel):
-    ciudad: str
+    municipio: str
     tratamiento: str
     umbral_valoracion: float = 0
 
@@ -41,11 +45,12 @@ class ResponseProveedor(BaseModel):
     valoracion: float
     capacidad_restante: int
     indice_ranking: float
+    modelo_aplicado: bool
 
 
 class RequestReserva(BaseModel):
     id_proveedor: int
-    ciudad: str
+    municipio: str
     tratamiento: str
     id_cliente: str
     id_gestor: str
@@ -89,7 +94,7 @@ class AsignacionDetalle(BaseModel):
     tratamiento: str
     observaciones: Optional[str] = None
     nombre_proveedor: str
-    ciudad: str
+    municipio: str
     id_cliente: str
     nombre_cliente: str
     poliza: str
@@ -99,32 +104,59 @@ class AsignacionDetalle(BaseModel):
     nombre_gestor: str
 
 
-def calcular_indice_ranking(costos: List[float], valoraciones: List[float]) -> List[float]:
-    costos_arr = np.array(costos, dtype=float)
-    valoraciones_arr = np.array(valoraciones, dtype=float)
-
-    costo_z = stats.zscore(costos_arr) if costos_arr.std() > 0 else np.zeros_like(costos_arr)
-    valoracion_z = (
-        stats.zscore(valoraciones_arr) if valoraciones_arr.std() > 0 else np.zeros_like(valoraciones_arr)
-    )
-
-    # Afinidad: a menor costo y mayor valoración, mejor índice. Se combinan con
-    # igual peso y se pasan por una sigmoide para acotar el resultado a (0, 1).
-    score = 0.5 * (-costo_z) + 0.5 * valoracion_z
-    return (1 / (1 + np.exp(-score))).tolist()
+def _beneficio(valores: np.ndarray) -> np.ndarray:
+    # Más alto = mejor (valoración, % capacidad disponible). Min-max 0..1.
+    if valores.max() == valores.min():
+        return np.ones_like(valores)
+    return (valores - valores.min()) / (valores.max() - valores.min())
 
 
-@app.get("/ciudades", response_model=List[str])
-def listar_ciudades() -> List[str]:
-    filas = supabase.table("proveedores").select("ciudad").execute().data
-    return sorted({f["ciudad"] for f in filas})
+def _coste(valores: np.ndarray) -> np.ndarray:
+    # Más bajo = mejor. Min-max invertido, 0..1.
+    if valores.max() == valores.min():
+        return np.ones_like(valores)
+    return (valores.max() - valores) / (valores.max() - valores.min())
+
+
+def calcular_ranking_modelo(
+    costos: List[float], valoraciones: List[float], pct_capacidad_disponible: List[float]
+) -> List[float]:
+    """Modelo de un compañero (Programa_optimizador_asignacion_proveedores_1.ipynb):
+    coste 50% + valoración 30% + capacidad disponible 20%, cada uno normalizado
+    min-max contra el resto de candidatos de esta búsqueda."""
+    score_coste = _coste(np.array(costos, dtype=float))
+    score_valoracion = _beneficio(np.array(valoraciones, dtype=float))
+    score_capacidad = _beneficio(np.array(pct_capacidad_disponible, dtype=float))
+    return (
+        PESO_COSTE * score_coste + PESO_VALORACION * score_valoracion + PESO_CAPACIDAD * score_capacidad
+    ).tolist()
+
+
+def calcular_orden_simple(valoraciones: List[float], costos: List[float]) -> List[float]:
+    """Para combinaciones con pasar_modelo=false: no corren el modelo (pocas
+    alternativas, no vale la pena). Orden transparente por valoración y costo,
+    sin pretender ser un score del modelo — solo para poder ordenar la lista."""
+    orden = sorted(range(len(valoraciones)), key=lambda i: (-valoraciones[i], costos[i]))
+    posicion = {i: pos for pos, i in enumerate(orden)}
+    n = len(valoraciones)
+    return [1 - posicion[i] / n for i in range(n)]
+
+
+@app.get("/municipios", response_model=List[str])
+def listar_municipios() -> List[str]:
+    filas = supabase.table("proveedores").select("municipio").execute().data
+    return sorted({f["municipio"] for f in filas})
 
 
 @app.get("/tratamientos", response_model=List[str])
-def listar_tratamientos(ciudad: str = Query(...)) -> List[str]:
+def listar_tratamientos(municipio: str = Query(...)) -> List[str]:
     ids_proveedor = [
         p["id_proveedor"]
-        for p in supabase.table("proveedores").select("id_proveedor").eq("ciudad", ciudad).execute().data
+        for p in supabase.table("proveedores")
+        .select("id_proveedor")
+        .eq("municipio", municipio)
+        .execute()
+        .data
     ]
     if not ids_proveedor:
         return []
@@ -177,7 +209,7 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     proveedores = (
         supabase.table("proveedores")
         .select("id_proveedor, nombre_proveedor, valoracion")
-        .eq("ciudad", request.ciudad)
+        .eq("municipio", request.municipio)
         .gte("valoracion", request.umbral_valoracion)
         .execute()
         .data
@@ -188,7 +220,7 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     ids_proveedor = [p["id_proveedor"] for p in proveedores]
     catalogo = (
         supabase.table("costo_tratamientos")
-        .select("id_proveedor, id_tratamiento, coste_medio")
+        .select("id_proveedor, id_tratamiento, coste_medio, pasar_modelo")
         .in_("id_proveedor", ids_proveedor)
         .eq("tratamiento", request.tratamiento)
         .execute()
@@ -211,25 +243,42 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     ids_tratamiento = list({fila["id_tratamiento"] for fila in catalogo_por_proveedor.values()})
     capacidades_filas = (
         supabase.table("capacidades")
-        .select("id_proveedor, id_tratamiento, capacidad_restante")
+        .select("id_proveedor, id_tratamiento, capacidad_maxima, capacidad_restante")
         .in_("id_proveedor", list(catalogo_por_proveedor.keys()))
         .in_("id_tratamiento", ids_tratamiento)
         .execute()
         .data
     )
-    capacidad_por_par = {
-        (c["id_proveedor"], c["id_tratamiento"]): c["capacidad_restante"] for c in capacidades_filas
-    }
+    capacidad_por_par = {(c["id_proveedor"], c["id_tratamiento"]): c for c in capacidades_filas}
 
     combinados = [
         (proveedores_por_id[id_proveedor], fila)
         for id_proveedor, fila in catalogo_por_proveedor.items()
     ]
 
-    indices = calcular_indice_ranking(
-        [fila["coste_medio"] for _, fila in combinados],
-        [p["valoracion"] for p, _ in combinados],
-    )
+    def capacidad_de(p, fila):
+        return capacidad_por_par.get((p["id_proveedor"], fila["id_tratamiento"]))
+
+    capacidad_restante = [
+        (capacidad_de(p, fila) or {}).get("capacidad_restante", 0) for p, fila in combinados
+    ]
+    pct_capacidad_disponible = [
+        (capacidad_de(p, fila) or {}).get("capacidad_restante", 0)
+        / max((capacidad_de(p, fila) or {}).get("capacidad_maxima", 1), 1)
+        for p, fila in combinados
+    ]
+    costos = [fila["coste_medio"] for _, fila in combinados]
+    valoraciones = [p["valoracion"] for p, _ in combinados]
+
+    # pasar_modelo es una propiedad de la combinación municipio+tratamiento
+    # buscada: todas las filas del catálogo que la componen comparten el
+    # mismo valor (verificado contra la base real), así que basta con leerlo
+    # de la primera.
+    modelo_aplicado = bool(combinados[0][1]["pasar_modelo"])
+    if modelo_aplicado:
+        indices = calcular_ranking_modelo(costos, valoraciones, pct_capacidad_disponible)
+    else:
+        indices = calcular_orden_simple(valoraciones, costos)
 
     respuesta = [
         ResponseProveedor(
@@ -237,10 +286,11 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
             nombre_proveedor=p["nombre_proveedor"],
             coste_estimado=fila["coste_medio"],
             valoracion=p["valoracion"],
-            capacidad_restante=capacidad_por_par.get((p["id_proveedor"], fila["id_tratamiento"]), 0),
+            capacidad_restante=restante,
             indice_ranking=indice,
+            modelo_aplicado=modelo_aplicado,
         )
-        for (p, fila), indice in zip(combinados, indices)
+        for (p, fila), restante, indice in zip(combinados, capacidad_restante, indices)
     ]
     return sorted(respuesta, key=lambda p: p.indice_ranking, reverse=True)
 
@@ -253,7 +303,7 @@ def reservar(request: RequestReserva) -> ResponseReserva:
     # al frontend.
     fila_tratamiento = (
         supabase.table("costo_tratamientos")
-        .select("id_tratamiento, id_ciudad")
+        .select("id_tratamiento, id_municipio")
         .eq("id_proveedor", request.id_proveedor)
         .eq("tratamiento", request.tratamiento)
         .limit(1)
@@ -263,7 +313,7 @@ def reservar(request: RequestReserva) -> ResponseReserva:
     if not fila_tratamiento:
         return ResponseReserva(status="error", mensaje="Ese proveedor no ofrece ese tratamiento")
     id_tratamiento = fila_tratamiento[0]["id_tratamiento"]
-    id_ciudad = fila_tratamiento[0]["id_ciudad"]
+    id_municipio = fila_tratamiento[0]["id_municipio"]
 
     es_edicion = request.id_reserva is not None
     par_anterior = None
@@ -302,7 +352,7 @@ def reservar(request: RequestReserva) -> ResponseReserva:
         "id_cliente": request.id_cliente,
         "id_proveedor": request.id_proveedor,
         "id_tratamiento": id_tratamiento,
-        "id_ciudad": id_ciudad,
+        "id_municipio": id_municipio,
         "tratamiento": request.tratamiento,
         "id_gestor": request.id_gestor,
         "fecha_servicio": request.fecha_servicio.isoformat(),
@@ -327,7 +377,7 @@ def listar_asignaciones(id_gestor: Optional[str] = None) -> List[AsignacionDetal
         .select(
             "id_reserva, id_proveedor, fecha_reserva, fecha_servicio, tipo_servicio,"
             " tratamiento, observaciones, id_cliente, id_gestor,"
-            " proveedores!asignaciones_id_proveedor_fkey(nombre_proveedor, ciudad),"
+            " proveedores!asignaciones_id_proveedor_fkey(nombre_proveedor, municipio),"
             " clientes(nombre_completo, poliza, documento, tipo_usuario),"
             " gestores(nombre)"
         )
@@ -348,7 +398,7 @@ def listar_asignaciones(id_gestor: Optional[str] = None) -> List[AsignacionDetal
             tratamiento=f["tratamiento"],
             observaciones=f["observaciones"],
             nombre_proveedor=f["proveedores"]["nombre_proveedor"],
-            ciudad=f["proveedores"]["ciudad"],
+            municipio=f["proveedores"]["municipio"],
             id_cliente=f["id_cliente"],
             nombre_cliente=f["clientes"]["nombre_completo"],
             poliza=f["clientes"]["poliza"],

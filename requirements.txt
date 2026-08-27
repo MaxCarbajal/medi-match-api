@@ -2,7 +2,6 @@ fastapi
 uvicorn
 pydantic
 supabase
-scipy
 numpy
 python-dotenv
 bcrypt
