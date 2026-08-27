@@ -327,7 +327,7 @@ def listar_asignaciones(id_gestor: Optional[str] = None) -> List[AsignacionDetal
         .select(
             "id_reserva, id_proveedor, fecha_reserva, fecha_servicio, tipo_servicio,"
             " tratamiento, observaciones, id_cliente, id_gestor,"
-            " proveedores(nombre_proveedor, ciudad),"
+            " proveedores!asignaciones_id_proveedor_fkey(nombre_proveedor, ciudad),"
             " clientes(nombre_completo, poliza, documento, tipo_usuario),"
             " gestores(nombre)"
         )
