@@ -10,15 +10,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
-# Pesos del modelo de ranking (Programa_optimizador_asignacion_proveedores_1.ipynb).
-PESO_COSTE = 0.50
-PESO_VALORACION = 0.30
+# Pesos del modelo de ranking. El notebook de referencia
+# (Programa_optimizador_asignacion_proveedores_1.ipynb) pondera coste 50% /
+# valoración 30% / capacidad 20%. Aquí se invierte coste↔valoración a pedido
+# del negocio: mayor calidad con poco ahorro debe ganarle a peor calidad con
+# mucho ahorro, así que la valoración pesa más que el % de ahorro.
+PESO_VALORACION = 0.50
+PESO_AHORRO = 0.30
 PESO_CAPACIDAD = 0.20
 
 load_dotenv()
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+# Límite global de resultados de /recomendar (0 = todos los que califiquen).
+# Es una sola variable de entorno para todo el sistema, no algo que el
+# frontend pueda pedir por búsqueda — se configura en el .env local o en
+# Vercel (Project Settings → Environment Variables del proyecto medi-match-api).
+CANTIDAD_PROVEEDORES_MOSTRAR = int(os.environ.get("CANTIDAD_PROVEEDORES_MOSTRAR", "0"))
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -32,8 +42,17 @@ app.add_middleware(
 )
 
 
-class RequestRecomendacion(BaseModel):
+class Municipio(BaseModel):
+    id_municipio: str
     municipio: str
+
+
+class RequestRecomendacion(BaseModel):
+    # id_municipio, no el nombre: varios municipios distintos comparten el
+    # mismo DESCMUNICIPIO en el dataset (p.ej. dos códigos distintos se llaman
+    # "CHACAO") — filtrar por texto los mezclaba y hacía inconsistente
+    # pasar_modelo dentro de una misma búsqueda.
+    id_municipio: str
     tratamiento: str
     umbral_valoracion: float = 0
 
@@ -44,6 +63,7 @@ class ResponseProveedor(BaseModel):
     coste_estimado: float
     valoracion: float
     capacidad_restante: int
+    ahorro_pct: float  # % de ahorro vs el costo promedio de esta búsqueda (negativo = más caro que el promedio)
     indice_ranking: float
     modelo_aplicado: bool
 
@@ -111,24 +131,29 @@ def _beneficio(valores: np.ndarray) -> np.ndarray:
     return (valores - valores.min()) / (valores.max() - valores.min())
 
 
-def _coste(valores: np.ndarray) -> np.ndarray:
-    # Más bajo = mejor. Min-max invertido, 0..1.
-    if valores.max() == valores.min():
-        return np.ones_like(valores)
-    return (valores.max() - valores) / (valores.max() - valores.min())
+def calcular_ahorro_pct(costos: List[float]) -> List[float]:
+    """% de ahorro de cada costo vs el costo promedio de este mismo grupo de
+    candidatos (positivo = más barato que el promedio, negativo = más caro)."""
+    costos_arr = np.array(costos, dtype=float)
+    promedio = costos_arr.mean()
+    if promedio == 0:
+        return [0.0] * len(costos)
+    return (((promedio - costos_arr) / promedio) * 100).tolist()
 
 
 def calcular_ranking_modelo(
-    costos: List[float], valoraciones: List[float], pct_capacidad_disponible: List[float]
+    ahorros_pct: List[float], valoraciones: List[float], pct_capacidad_disponible: List[float]
 ) -> List[float]:
-    """Modelo de un compañero (Programa_optimizador_asignacion_proveedores_1.ipynb):
-    coste 50% + valoración 30% + capacidad disponible 20%, cada uno normalizado
-    min-max contra el resto de candidatos de esta búsqueda."""
-    score_coste = _coste(np.array(costos, dtype=float))
+    """Modelo de un compañero (Programa_optimizador_asignacion_proveedores_1.ipynb),
+    adaptado: valoración 50% + % de ahorro 30% + capacidad disponible 20%, cada
+    uno normalizado min-max contra el resto de candidatos de esta búsqueda. La
+    valoración pesa más que el ahorro a propósito: mayor calidad ahorrando poco
+    debe ganarle a peor calidad ahorrando mucho."""
+    score_ahorro = _beneficio(np.array(ahorros_pct, dtype=float))
     score_valoracion = _beneficio(np.array(valoraciones, dtype=float))
     score_capacidad = _beneficio(np.array(pct_capacidad_disponible, dtype=float))
     return (
-        PESO_COSTE * score_coste + PESO_VALORACION * score_valoracion + PESO_CAPACIDAD * score_capacidad
+        PESO_VALORACION * score_valoracion + PESO_AHORRO * score_ahorro + PESO_CAPACIDAD * score_capacidad
     ).tolist()
 
 
@@ -142,19 +167,25 @@ def calcular_orden_simple(valoraciones: List[float], costos: List[float]) -> Lis
     return [1 - posicion[i] / n for i in range(n)]
 
 
-@app.get("/municipios", response_model=List[str])
-def listar_municipios() -> List[str]:
-    filas = supabase.table("proveedores").select("municipio").execute().data
-    return sorted({f["municipio"] for f in filas})
+@app.get("/municipios", response_model=List[Municipio])
+def listar_municipios() -> List[Municipio]:
+    filas = supabase.table("proveedores").select("id_municipio, municipio").execute().data
+    # (id_municipio, municipio): el nombre solo no alcanza como identidad —
+    # ver comentario en RequestRecomendacion.
+    vistos = {(f["id_municipio"], f["municipio"]) for f in filas}
+    return sorted(
+        (Municipio(id_municipio=id_municipio, municipio=nombre) for id_municipio, nombre in vistos),
+        key=lambda m: (m.municipio, m.id_municipio),
+    )
 
 
 @app.get("/tratamientos", response_model=List[str])
-def listar_tratamientos(municipio: str = Query(...)) -> List[str]:
+def listar_tratamientos(id_municipio: str = Query(...)) -> List[str]:
     ids_proveedor = [
         p["id_proveedor"]
         for p in supabase.table("proveedores")
         .select("id_proveedor")
-        .eq("municipio", municipio)
+        .eq("id_municipio", id_municipio)
         .execute()
         .data
     ]
@@ -209,7 +240,7 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     proveedores = (
         supabase.table("proveedores")
         .select("id_proveedor, nombre_proveedor, valoracion")
-        .eq("municipio", request.municipio)
+        .eq("id_municipio", request.id_municipio)
         .gte("valoracion", request.umbral_valoracion)
         .execute()
         .data
@@ -269,6 +300,7 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     ]
     costos = [fila["coste_medio"] for _, fila in combinados]
     valoraciones = [p["valoracion"] for p, _ in combinados]
+    ahorros_pct = calcular_ahorro_pct(costos)
 
     # pasar_modelo es una propiedad de la combinación municipio+tratamiento
     # buscada: todas las filas del catálogo que la componen comparten el
@@ -276,7 +308,7 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     # de la primera.
     modelo_aplicado = bool(combinados[0][1]["pasar_modelo"])
     if modelo_aplicado:
-        indices = calcular_ranking_modelo(costos, valoraciones, pct_capacidad_disponible)
+        indices = calcular_ranking_modelo(ahorros_pct, valoraciones, pct_capacidad_disponible)
     else:
         indices = calcular_orden_simple(valoraciones, costos)
 
@@ -287,12 +319,16 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
             coste_estimado=fila["coste_medio"],
             valoracion=p["valoracion"],
             capacidad_restante=restante,
+            ahorro_pct=ahorro,
             indice_ranking=indice,
             modelo_aplicado=modelo_aplicado,
         )
-        for (p, fila), restante, indice in zip(combinados, capacidad_restante, indices)
+        for (p, fila), restante, ahorro, indice in zip(combinados, capacidad_restante, ahorros_pct, indices)
     ]
-    return sorted(respuesta, key=lambda p: p.indice_ranking, reverse=True)
+    ordenado = sorted(respuesta, key=lambda p: p.indice_ranking, reverse=True)
+    if CANTIDAD_PROVEEDORES_MOSTRAR > 0:
+        ordenado = ordenado[:CANTIDAD_PROVEEDORES_MOSTRAR]
+    return ordenado
 
 
 @app.post("/reservar", response_model=ResponseReserva)
