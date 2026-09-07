@@ -167,6 +167,30 @@ def calcular_orden_simple(valoraciones: List[float], costos: List[float]) -> Lis
     return [1 - posicion[i] / n for i in range(n)]
 
 
+class ConfigDiagnostico(BaseModel):
+    cantidad_proveedores_mostrar: int
+    vercel_env: Optional[str] = None
+    vercel_region: Optional[str] = None
+    vercel_git_commit_sha: Optional[str] = None
+    vercel_git_commit_ref: Optional[str] = None
+
+
+@app.get("/config", response_model=ConfigDiagnostico)
+def config_diagnostico() -> ConfigDiagnostico:
+    # Diagnóstico en vivo, no un secreto: sirve para confirmar sin
+    # adivinar, desde curl, qué env vars y qué commit está sirviendo
+    # realmente la instancia que responde (útil porque Vercel puede tardar
+    # en propagar un deploy nuevo a todas las instancias — ver
+    # docs/DECISIONES.md, 2026-09-07/08).
+    return ConfigDiagnostico(
+        cantidad_proveedores_mostrar=CANTIDAD_PROVEEDORES_MOSTRAR,
+        vercel_env=os.environ.get("VERCEL_ENV"),
+        vercel_region=os.environ.get("VERCEL_REGION"),
+        vercel_git_commit_sha=os.environ.get("VERCEL_GIT_COMMIT_SHA"),
+        vercel_git_commit_ref=os.environ.get("VERCEL_GIT_COMMIT_REF"),
+    )
+
+
 @app.get("/municipios", response_model=List[Municipio])
 def listar_municipios() -> List[Municipio]:
     filas = supabase.table("proveedores").select("id_municipio, municipio").execute().data
