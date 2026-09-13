@@ -74,8 +74,23 @@ class ResponseProveedor(BaseModel):
     valoracion: float
     capacidad_restante: int
     ahorro_pct: float  # % de ahorro vs el costo promedio de esta búsqueda (negativo = más caro que el promedio)
+    # % de ahorro vs el promedio de TODOS los proveedores del mismo
+    # tratamiento en el municipio (no solo los que quedaron en esta
+    # búsqueda) -- cálculo aparte, ver _promedio_costo_municipio. None si el
+    # municipio no tiene otro proveedor con el mismo tratamiento para comparar.
+    ahorro_referencia_municipio_pct: Optional[float] = None
     indice_ranking: float
     modelo_aplicado: bool
+    # NULL para los proveedores sin match en el scrape de Google Places (ver
+    # docs/DECISIONES.md, 2026-09-13) -- el frontend cae a un link de
+    # búsqueda por nombre cuando vienen vacíos.
+    google_place_id: Optional[str] = None
+    google_maps_url: Optional[str] = None
+    # Texto plano, no depende de que el iframe de preview de Maps (sin API
+    # key) decida mostrar la ficha del lugar -- resultó no ser confiable
+    # (ver docs/DECISIONES.md, 2026-09-13).
+    direccion: Optional[str] = None
+    telefono: Optional[str] = None
 
 
 class RequestReserva(BaseModel):
@@ -155,6 +170,40 @@ def calcular_ahorro_pct(costos: List[float]) -> List[float]:
     if promedio == 0:
         return [0.0] * len(costos)
     return (((promedio - costos_arr) / promedio) * 100).tolist()
+
+
+# --- Ahorro de referencia (municipio) -----------------------------------
+# Bloque totalmente separado de calcular_ranking_modelo/calcular_ahorro_pct
+# de arriba -- no toca el optimizador del compañero ni el índice de ranking.
+# Motivo: calcular_ahorro_pct compara contra el promedio de los candidatos
+# que quedaron en ESTA búsqueda después de filtrar por valoración/capacidad;
+# cuando esa búsqueda no pasa por el modelo (pasar_modelo=false) suele quedar
+# 1 solo candidato (ver docs/DECISIONES.md), y comparar un valor contra el
+# promedio de sí mismo da 0% siempre -- no es un bug del cálculo, es que no
+# hay nada más para comparar en ese grupo chico. Este bloque compara en
+# cambio contra el promedio de TODOS los proveedores que ofrecen el mismo
+# tratamiento en el mismo municipio (sin el filtro de valoración/capacidad),
+# así sigue siendo útil aunque la búsqueda final muestre pocos proveedores.
+def _promedio_costo_municipio(id_municipio: str, id_tratamiento: int) -> Optional[float]:
+    filas = (
+        supabase.table("costo_tratamientos")
+        .select("coste_medio")
+        .eq("id_municipio", id_municipio)
+        .eq("id_tratamiento", id_tratamiento)
+        .execute()
+        .data
+    )
+    if len(filas) < 2:
+        # Un solo proveedor en todo el municipio -- no hay contra qué
+        # comparar, no se inventa un ahorro.
+        return None
+    return sum(f["coste_medio"] for f in filas) / len(filas)
+
+
+def calcular_ahorro_referencia_pct(costo: float, promedio_municipio: Optional[float]) -> Optional[float]:
+    if promedio_municipio is None or promedio_municipio == 0:
+        return None
+    return ((promedio_municipio - costo) / promedio_municipio) * 100
 
 
 def _resolver_milp_cuota(
@@ -340,16 +389,45 @@ def buscar_clientes(q: str = Query(..., min_length=2)) -> List[Cliente]:
     return filas
 
 
+_CAMPOS_PROVEEDOR_BASE = "id_proveedor, nombre_proveedor, valoracion"
+_CAMPOS_PROVEEDOR_GOOGLE = ["google_place_id", "google_maps_url"]  # migración 022
+_CAMPOS_PROVEEDOR_DIRECCION = ["direccion", "telefono"]  # migración 023
+_TODOS_LOS_CAMPOS_OPCIONALES = _CAMPOS_PROVEEDOR_GOOGLE + _CAMPOS_PROVEEDOR_DIRECCION
+
+
+def _seleccionar_proveedores(id_municipio: str, umbral_valoracion: float) -> List[dict]:
+    # Cubre el período entre desplegar este código y aplicar las migraciones
+    # 022/023 a mano (medi-match-db/migrations) — sin esas columnas todavía,
+    # PostgREST devuelve error, no filas sin ellas. Se intenta con todo y se
+    # va cayendo a menos columnas (022 sin 023, o ninguna) en vez de romper
+    # /recomendar por completo.
+    intentos = [
+        _TODOS_LOS_CAMPOS_OPCIONALES,
+        _CAMPOS_PROVEEDOR_GOOGLE,
+        [],
+    ]
+    for campos_extra in intentos:
+        try:
+            filas = (
+                supabase.table("proveedores")
+                .select(", ".join([_CAMPOS_PROVEEDOR_BASE, *campos_extra]))
+                .eq("id_municipio", id_municipio)
+                .gte("valoracion", umbral_valoracion)
+                .execute()
+                .data
+            )
+        except Exception:
+            continue
+        for fila in filas:
+            for campo in _TODOS_LOS_CAMPOS_OPCIONALES:
+                fila.setdefault(campo, None)
+        return filas
+    return []
+
+
 @app.post("/recomendar", response_model=List[ResponseProveedor])
 def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
-    proveedores = (
-        supabase.table("proveedores")
-        .select("id_proveedor, nombre_proveedor, valoracion")
-        .eq("id_municipio", request.id_municipio)
-        .gte("valoracion", request.umbral_valoracion)
-        .execute()
-        .data
-    )
+    proveedores = _seleccionar_proveedores(request.id_municipio, request.umbral_valoracion)
     if not proveedores:
         return []
 
@@ -420,8 +498,14 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     valoraciones = [p["valoracion"] for p, _ in combinados]
     ahorros_pct = calcular_ahorro_pct(costos)
 
+    # id_tratamiento es una propiedad del catálogo (no del modelo) — se lee
+    # una sola vez y se usa tanto para el forecast (solo si modelo_aplicado)
+    # como para el ahorro de referencia de abajo (siempre).
+    id_tratamiento = combinados[0][1]["id_tratamiento"]
+    promedio_municipio = _promedio_costo_municipio(request.id_municipio, id_tratamiento)
+    ahorros_referencia_pct = [calcular_ahorro_referencia_pct(c, promedio_municipio) for c in costos]
+
     if modelo_aplicado:
-        id_tratamiento = combinados[0][1]["id_tratamiento"]
         try:
             forecast_filas = (
                 supabase.table("forecast_demanda")
@@ -461,10 +545,17 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
             valoracion=p["valoracion"],
             capacidad_restante=restante,
             ahorro_pct=ahorro,
+            ahorro_referencia_municipio_pct=ahorro_referencia,
             indice_ranking=indice,
             modelo_aplicado=modelo_aplicado,
+            google_place_id=p.get("google_place_id"),
+            google_maps_url=p.get("google_maps_url"),
+            direccion=p.get("direccion"),
+            telefono=p.get("telefono"),
         )
-        for (p, fila), restante, ahorro, indice in zip(combinados, capacidad_restante, ahorros_pct, indices)
+        for (p, fila), restante, ahorro, ahorro_referencia, indice in zip(
+            combinados, capacidad_restante, ahorros_pct, ahorros_referencia_pct, indices
+        )
     ]
     ordenado = sorted(respuesta, key=lambda p: p.indice_ranking, reverse=True)
     if CANTIDAD_PROVEEDORES_MOSTRAR > 0:
