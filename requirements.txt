@@ -3,5 +3,6 @@ uvicorn
 pydantic
 supabase
 numpy
+scipy
 python-dotenv
 bcrypt

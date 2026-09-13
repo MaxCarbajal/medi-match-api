@@ -8,16 +8,26 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from scipy.optimize import Bounds, LinearConstraint, milp
 from supabase import Client, create_client
 
-# Pesos del modelo de ranking. El notebook de referencia
-# (Programa_optimizador_asignacion_proveedores_1.ipynb) pondera coste 50% /
-# valoración 30% / capacidad 20%. Aquí se invierte coste↔valoración a pedido
-# del negocio: mayor calidad con poco ahorro debe ganarle a peor calidad con
-# mucho ahorro, así que la valoración pesa más que el % de ahorro.
-PESO_VALORACION = 0.50
-PESO_AHORRO = 0.30
+# Pesos del modelo de ranking v2 (medi-match-api/modelo_miguel/Optimizador_Web_Pesos3.ipynb,
+# portado 2026-09-13 — reemplaza el índice anterior de 3 variables,
+# Programa_optimizador_asignacion_proveedores_1.ipynb, ver docs/DECISIONES.md).
+# 4 variables: coste, valoración, capacidad (relativa a la demanda
+# pronosticada de las próximas 4 semanas) y la cuota que le toca a cada
+# proveedor en un MILP de asignación óptima (scipy) resuelto en cada
+# búsqueda. Solo corre cuando pasar_modelo=true (existe forecast, ver
+# forecast_demanda) — para el resto sigue calcular_orden_simple.
+PESO_COSTE = 0.25
+PESO_VALORACION = 0.45
 PESO_CAPACIDAD = 0.20
+PESO_CUOTA_MILP = 0.10
+
+# El cuaderno de referencia usa 30s de límite para el MILP; es demasiado
+# para una petición HTTP síncrona. Los mercados con forecast tienen como
+# máximo ~13 proveedores, así que 5s ya es un margen amplio.
+MILP_TIME_LIMIT_SEGUNDOS = 5
 
 load_dotenv()
 
@@ -124,16 +134,22 @@ class AsignacionDetalle(BaseModel):
     nombre_gestor: str
 
 
-def _beneficio(valores: np.ndarray) -> np.ndarray:
-    # Más alto = mejor (valoración, % capacidad disponible). Min-max 0..1.
+def _beneficio(valores: np.ndarray, invertir: bool = False) -> np.ndarray:
+    # Normalización min-max 0..1 contra el resto de candidatos de esta
+    # búsqueda. Más alto = mejor. invertir=True para variables donde menor
+    # es mejor (coste): se resta de 1 después de normalizar.
     if valores.max() == valores.min():
-        return np.ones_like(valores)
-    return (valores - valores.min()) / (valores.max() - valores.min())
+        resultado = np.ones_like(valores)
+    else:
+        resultado = (valores - valores.min()) / (valores.max() - valores.min())
+    return 1 - resultado if invertir else resultado
 
 
 def calcular_ahorro_pct(costos: List[float]) -> List[float]:
     """% de ahorro de cada costo vs el costo promedio de este mismo grupo de
-    candidatos (positivo = más barato que el promedio, negativo = más caro)."""
+    candidatos (positivo = más barato que el promedio, negativo = más caro).
+    Ya no alimenta el ranking (ver calcular_ranking_modelo) — se mantiene
+    solo para mostrarlo en la tarjeta de proveedor del frontend."""
     costos_arr = np.array(costos, dtype=float)
     promedio = costos_arr.mean()
     if promedio == 0:
@@ -141,19 +157,84 @@ def calcular_ahorro_pct(costos: List[float]) -> List[float]:
     return (((promedio - costos_arr) / promedio) * 100).tolist()
 
 
+def _resolver_milp_cuota(
+    costos: np.ndarray,
+    valoraciones: np.ndarray,
+    capacidad_4_semanas: np.ndarray,
+    demanda_operativa: int,
+    umbral_valoracion: float,
+) -> np.ndarray:
+    """Corre el MILP de asignación óptima (minimiza coste total repartiendo
+    la demanda pronosticada entre proveedores, respetando su capacidad y una
+    valoración media mínima) y devuelve cuántos servicios le tocó a cada
+    proveedor en esa asignación (0 si ninguno). Sin demanda operativa o con
+    el problema infactible, devuelve todo ceros: el score de cuota queda
+    neutro para todos, no rompe el resto del índice."""
+    n = len(costos)
+    if n == 0 or demanda_operativa <= 0:
+        return np.zeros(n)
+
+    capacidades_enteras = np.floor(capacidad_4_semanas + 1e-9)
+    restricciones = LinearConstraint(
+        np.vstack([np.ones(n), valoraciones]),
+        [demanda_operativa, demanda_operativa * umbral_valoracion],
+        [demanda_operativa, np.inf],
+    )
+    resultado = milp(
+        c=costos,
+        integrality=np.ones(n),
+        bounds=Bounds(np.zeros(n), capacidades_enteras),
+        constraints=restricciones,
+        options={"time_limit": MILP_TIME_LIMIT_SEGUNDOS},
+    )
+    if not resultado.success:
+        return np.zeros(n)
+    return np.rint(resultado.x)
+
+
 def calcular_ranking_modelo(
-    ahorros_pct: List[float], valoraciones: List[float], pct_capacidad_disponible: List[float]
+    costos: List[float],
+    valoraciones: List[float],
+    capacidad_restante: List[int],
+    demanda_forecast: float,
+    demanda_operativa: int,
+    umbral_valoracion: float,
 ) -> List[float]:
-    """Modelo de un compañero (Programa_optimizador_asignacion_proveedores_1.ipynb),
-    adaptado: valoración 50% + % de ahorro 30% + capacidad disponible 20%, cada
-    uno normalizado min-max contra el resto de candidatos de esta búsqueda. La
-    valoración pesa más que el ahorro a propósito: mayor calidad ahorrando poco
-    debe ganarle a peor calidad ahorrando mucho."""
-    score_ahorro = _beneficio(np.array(ahorros_pct, dtype=float))
-    score_valoracion = _beneficio(np.array(valoraciones, dtype=float))
-    score_capacidad = _beneficio(np.array(pct_capacidad_disponible, dtype=float))
+    """Modelo de un compañero (modelo_miguel/Optimizador_Web_Pesos3.ipynb):
+    coste 25% + valoración 45% + capacidad (relativa a la demanda pronosticada
+    de las próximas 4 semanas) 20% + cuota de un MILP de asignación óptima
+    10%, cada score normalizado min-max contra el resto de candidatos de esta
+    búsqueda. Reemplaza el índice anterior (valoración 50 / ahorro 30 /
+    capacidad 20) — ver docs/DECISIONES.md, 2026-09-13.
+
+    Usa capacidad_restante (lo que de verdad queda), no la capacidad
+    contratada completa: esta última nunca se resetea en producción (ver
+    docs/DECISIONES.md), así que usarla tal cual recomendaría proveedores ya
+    agotados como si tuvieran toda su capacidad libre."""
+    costos_arr = np.array(costos, dtype=float)
+    valoraciones_arr = np.array(valoraciones, dtype=float)
+    capacidad_4_semanas = np.array(capacidad_restante, dtype=float) * 4 / 52
+
+    score_coste = _beneficio(costos_arr, invertir=True)
+    score_valoracion = _beneficio(valoraciones_arr)
+
+    capacidad_relativa = (
+        capacidad_4_semanas / demanda_forecast
+        if demanda_forecast > 0
+        else np.zeros_like(capacidad_4_semanas)
+    )
+    score_capacidad = _beneficio(capacidad_relativa)
+
+    cuota = _resolver_milp_cuota(
+        costos_arr, valoraciones_arr, capacidad_4_semanas, demanda_operativa, umbral_valoracion
+    )
+    score_cuota = cuota / cuota.max() if cuota.max() > 0 else np.zeros_like(cuota)
+
     return (
-        PESO_VALORACION * score_valoracion + PESO_AHORRO * score_ahorro + PESO_CAPACIDAD * score_capacidad
+        PESO_COSTE * score_coste
+        + PESO_VALORACION * score_valoracion
+        + PESO_CAPACIDAD * score_capacidad
+        + PESO_CUOTA_MILP * score_cuota
     ).tolist()
 
 
@@ -314,25 +395,61 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     def capacidad_de(p, fila):
         return capacidad_por_par.get((p["id_proveedor"], fila["id_tratamiento"]))
 
+    # pasar_modelo es una propiedad de la combinación municipio+tratamiento
+    # buscada: todas las filas del catálogo que la componen comparten el
+    # mismo valor (verificado contra la base real), así que basta con leerlo
+    # de la primera — antes de filtrar nada.
+    modelo_aplicado = bool(combinados[0][1]["pasar_modelo"])
+
+    if modelo_aplicado:
+        # El modelo v2 no tiene sentido para un proveedor ya agotado —se
+        # filtra antes de rankear. El camino sin modelo no cambia de
+        # comportamiento (no se pidió tocarlo).
+        combinados = [
+            (p, fila)
+            for p, fila in combinados
+            if (capacidad_de(p, fila) or {}).get("capacidad_restante", 0) > 0
+        ]
+        if not combinados:
+            return []
+
     capacidad_restante = [
         (capacidad_de(p, fila) or {}).get("capacidad_restante", 0) for p, fila in combinados
-    ]
-    pct_capacidad_disponible = [
-        (capacidad_de(p, fila) or {}).get("capacidad_restante", 0)
-        / max((capacidad_de(p, fila) or {}).get("capacidad_maxima", 1), 1)
-        for p, fila in combinados
     ]
     costos = [fila["coste_medio"] for _, fila in combinados]
     valoraciones = [p["valoracion"] for p, _ in combinados]
     ahorros_pct = calcular_ahorro_pct(costos)
 
-    # pasar_modelo es una propiedad de la combinación municipio+tratamiento
-    # buscada: todas las filas del catálogo que la componen comparten el
-    # mismo valor (verificado contra la base real), así que basta con leerlo
-    # de la primera.
-    modelo_aplicado = bool(combinados[0][1]["pasar_modelo"])
     if modelo_aplicado:
-        indices = calcular_ranking_modelo(ahorros_pct, valoraciones, pct_capacidad_disponible)
+        id_tratamiento = combinados[0][1]["id_tratamiento"]
+        try:
+            forecast_filas = (
+                supabase.table("forecast_demanda")
+                .select("demanda_forecast, demanda_operativa")
+                .eq("id_municipio", request.id_municipio)
+                .eq("id_tratamiento", id_tratamiento)
+                .execute()
+                .data
+            )
+        except Exception:
+            # Cubre el período entre desplegar este código y aplicar la
+            # migración 021 a mano (medi-match-db/migrations) — sin la
+            # tabla todavía, PostgREST devuelve error, no una lista vacía.
+            forecast_filas = []
+        if forecast_filas:
+            indices = calcular_ranking_modelo(
+                costos,
+                valoraciones,
+                capacidad_restante,
+                demanda_forecast=forecast_filas[0]["demanda_forecast"],
+                demanda_operativa=forecast_filas[0]["demanda_operativa"],
+                umbral_valoracion=request.umbral_valoracion,
+            )
+        else:
+            # No debería pasar — pasar_modelo=true implica forecast cargado
+            # (verificado 1:1, ver docs/DECISIONES.md) — pero si pasa, no
+            # romper la búsqueda por un dato faltante.
+            indices = calcular_orden_simple(valoraciones, costos)
     else:
         indices = calcular_orden_simple(valoraciones, costos)
 
