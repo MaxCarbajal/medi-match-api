@@ -395,12 +395,20 @@ _CAMPOS_PROVEEDOR_DIRECCION = ["direccion", "telefono"]  # migración 023
 _TODOS_LOS_CAMPOS_OPCIONALES = _CAMPOS_PROVEEDOR_GOOGLE + _CAMPOS_PROVEEDOR_DIRECCION
 
 
-def _seleccionar_proveedores(id_municipio: str, umbral_valoracion: float) -> List[dict]:
-    # Cubre el período entre desplegar este código y aplicar las migraciones
-    # 022/023 a mano (medi-match-db/migrations) — sin esas columnas todavía,
-    # PostgREST devuelve error, no filas sin ellas. Se intenta con todo y se
-    # va cayendo a menos columnas (022 sin 023, o ninguna) en vez de romper
-    # /recomendar por completo.
+def _seleccionar_proveedores(id_municipio: str) -> List[dict]:
+    # Sin filtro de valoración acá a propósito (ver docs/DECISIONES.md,
+    # 2026-09-13): el cuaderno de referencia (Optimizador_Web_Pesos3.ipynb)
+    # arma el ranking/MILP con TODOS los proveedores de la serie
+    # municipio+tratamiento, sin importar su valoración, y recién filtra por
+    # umbral para lo que se muestra al final. Filtrar acá antes cambiaba la
+    # normalización min-max y la cuota del MILP -- el umbral se aplica más
+    # abajo, después de rankear.
+    #
+    # Cubre también el período entre desplegar este código y aplicar las
+    # migraciones 022/023 a mano (medi-match-db/migrations) — sin esas
+    # columnas todavía, PostgREST devuelve error, no filas sin ellas. Se
+    # intenta con todo y se va cayendo a menos columnas (022 sin 023, o
+    # ninguna) en vez de romper /recomendar por completo.
     intentos = [
         _TODOS_LOS_CAMPOS_OPCIONALES,
         _CAMPOS_PROVEEDOR_GOOGLE,
@@ -412,7 +420,6 @@ def _seleccionar_proveedores(id_municipio: str, umbral_valoracion: float) -> Lis
                 supabase.table("proveedores")
                 .select(", ".join([_CAMPOS_PROVEEDOR_BASE, *campos_extra]))
                 .eq("id_municipio", id_municipio)
-                .gte("valoracion", umbral_valoracion)
                 .execute()
                 .data
             )
@@ -427,7 +434,7 @@ def _seleccionar_proveedores(id_municipio: str, umbral_valoracion: float) -> Lis
 
 @app.post("/recomendar", response_model=List[ResponseProveedor])
 def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
-    proveedores = _seleccionar_proveedores(request.id_municipio, request.umbral_valoracion)
+    proveedores = _seleccionar_proveedores(request.id_municipio)
     if not proveedores:
         return []
 
@@ -496,14 +503,10 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     ]
     costos = [fila["coste_medio"] for _, fila in combinados]
     valoraciones = [p["valoracion"] for p, _ in combinados]
-    ahorros_pct = calcular_ahorro_pct(costos)
 
     # id_tratamiento es una propiedad del catálogo (no del modelo) — se lee
-    # una sola vez y se usa tanto para el forecast (solo si modelo_aplicado)
-    # como para el ahorro de referencia de abajo (siempre).
+    # una sola vez y se usa para el forecast (solo si modelo_aplicado).
     id_tratamiento = combinados[0][1]["id_tratamiento"]
-    promedio_municipio = _promedio_costo_municipio(request.id_municipio, id_tratamiento)
-    ahorros_referencia_pct = [calcular_ahorro_referencia_pct(c, promedio_municipio) for c in costos]
 
     if modelo_aplicado:
         try:
@@ -537,27 +540,47 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
     else:
         indices = calcular_orden_simple(valoraciones, costos)
 
-    respuesta = [
-        ResponseProveedor(
-            id_proveedor=p["id_proveedor"],
-            nombre_proveedor=p["nombre_proveedor"],
-            coste_estimado=fila["coste_medio"],
-            valoracion=p["valoracion"],
-            capacidad_restante=restante,
-            ahorro_pct=ahorro,
-            ahorro_referencia_municipio_pct=ahorro_referencia,
-            indice_ranking=indice,
-            modelo_aplicado=modelo_aplicado,
-            google_place_id=p.get("google_place_id"),
-            google_maps_url=p.get("google_maps_url"),
-            direccion=p.get("direccion"),
-            telefono=p.get("telefono"),
+    # El umbral de valoración se aplica recién acá -- después de rankear,
+    # no antes (ver comentario en _seleccionar_proveedores). Todo lo de
+    # arriba (normalización, MILP) ya corrió sobre el pool completo; esto
+    # solo decide qué se muestra.
+    visibles = [i for i, v in enumerate(valoraciones) if v >= request.umbral_valoracion]
+    if not visibles:
+        return []
+
+    # ahorro_pct/ahorro_referencia_municipio_pct son métricas de vitrina
+    # (no alimentan el ranking) -- "el promedio de esta búsqueda" se calcula
+    # sobre lo que el gestor realmente ve, no sobre el pool completo del MILP.
+    costos_visibles = [costos[i] for i in visibles]
+    ahorros_pct = calcular_ahorro_pct(costos_visibles)
+    promedio_municipio = _promedio_costo_municipio(request.id_municipio, id_tratamiento)
+    ahorros_referencia_pct = [calcular_ahorro_referencia_pct(c, promedio_municipio) for c in costos_visibles]
+
+    respuesta = []
+    for i, ahorro, ahorro_referencia in zip(visibles, ahorros_pct, ahorros_referencia_pct):
+        p, fila = combinados[i]
+        respuesta.append(
+            ResponseProveedor(
+                id_proveedor=p["id_proveedor"],
+                nombre_proveedor=p["nombre_proveedor"],
+                coste_estimado=fila["coste_medio"],
+                valoracion=p["valoracion"],
+                capacidad_restante=capacidad_restante[i],
+                ahorro_pct=ahorro,
+                ahorro_referencia_municipio_pct=ahorro_referencia,
+                indice_ranking=indices[i],
+                modelo_aplicado=modelo_aplicado,
+                google_place_id=p.get("google_place_id"),
+                google_maps_url=p.get("google_maps_url"),
+                direccion=p.get("direccion"),
+                telefono=p.get("telefono"),
+            )
         )
-        for (p, fila), restante, ahorro, ahorro_referencia, indice in zip(
-            combinados, capacidad_restante, ahorros_pct, ahorros_referencia_pct, indices
-        )
-    ]
-    ordenado = sorted(respuesta, key=lambda p: p.indice_ranking, reverse=True)
+    # Desempate por coste ascendente (más barato primero), igual que el
+    # cuaderno de referencia (sort_values(["RankingWeb","CosteMedio"],
+    # ascending=[False, True])) -- con pocos candidatos y normalización
+    # min-max, los empates en indice_ranking son comunes.
+    ordenado = sorted(respuesta, key=lambda p: (-p.indice_ranking, p.coste_estimado))
     if CANTIDAD_PROVEEDORES_MOSTRAR > 0:
         ordenado = ordenado[:CANTIDAD_PROVEEDORES_MOSTRAR]
     return ordenado
