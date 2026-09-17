@@ -40,6 +40,15 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 # Vercel (Project Settings → Environment Variables del proyecto medi-match-api).
 CANTIDAD_PROVEEDORES_MOSTRAR = int(os.environ.get("CANTIDAD_PROVEEDORES_MOSTRAR", "0"))
 
+# Oculta combinaciones municipio+tratamiento con menos proveedores
+# alternativos que este mínimo -- no hay contra qué comparar/rankear de
+# verdad (ver docs/DECISIONES.md, 2026-09-17: 88.9% de las 6.246
+# combinaciones tiene <3 proveedores; ninguna combinación con
+# pasar_modelo=true queda afectada, todas tienen >=7). Mismo patrón que
+# CANTIDAD_PROVEEDORES_MOSTRAR: variable de entorno global, no un campo
+# editable por búsqueda.
+MIN_PROVEEDORES_COMBINACION = int(os.environ.get("MIN_PROVEEDORES_COMBINACION", "3"))
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 app = FastAPI(title="MediMatch API")
@@ -348,12 +357,19 @@ def listar_tratamientos(id_municipio: str = Query(...)) -> List[str]:
 
     filas = (
         supabase.table("costo_tratamientos")
-        .select("tratamiento")
+        .select("tratamiento, id_proveedor")
         .in_("id_proveedor", ids_proveedor)
         .execute()
         .data
     )
-    return sorted({f["tratamiento"] for f in filas})
+    proveedores_por_tratamiento: dict[str, set] = {}
+    for f in filas:
+        proveedores_por_tratamiento.setdefault(f["tratamiento"], set()).add(f["id_proveedor"])
+    return sorted(
+        tratamiento
+        for tratamiento, proveedores in proveedores_por_tratamiento.items()
+        if len(proveedores) >= MIN_PROVEEDORES_COMBINACION
+    )
 
 
 @app.post("/login", response_model=Gestor)
@@ -458,6 +474,12 @@ def recomendar(request: RequestRecomendacion) -> List[ResponseProveedor]:
         actual = catalogo_por_proveedor.get(fila["id_proveedor"])
         if actual is None or fila["coste_medio"] < actual["coste_medio"]:
             catalogo_por_proveedor[fila["id_proveedor"]] = fila
+
+    # Mismo mínimo que /tratamientos (ver MIN_PROVEEDORES_COMBINACION) --
+    # por si se llama esta ruta directo con una combinación que ya no
+    # debería ser buscable.
+    if len(catalogo_por_proveedor) < MIN_PROVEEDORES_COMBINACION:
+        return []
 
     # La capacidad es por par (proveedor, tratamiento), no un pool compartido
     # por todo lo que ofrece el proveedor.
